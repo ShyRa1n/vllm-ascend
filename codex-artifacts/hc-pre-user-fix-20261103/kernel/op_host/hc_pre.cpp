@@ -91,24 +91,18 @@ uint32_t SigmoidTmpFor(const std::vector<int64_t> &shape)
 // zero in steady state (same policy as weight-repack caching in conv
 // pipelines).
 //
-// D-fix (precision, mandatory): hcFnT additionally gets its low 13 mantissa
-// bits cleared (RTZ truncation), which is bit-exact with the frozen CPU
-// oracle's _to_hf32(hc_fn). Rationale: the cube HF32 conversion is a NEAREST
-// rounding (ties-even/ties-away per the SetHF32 transMode — measured to
-// differ only at tie points, ~1e-7 on contract data), NOT a truncation; on
-// hc_fn's all-positive rand data nearest-vs-RTZ leaves a systematic
-// per-element bias that accumulates over K=20480 into max pre/post
-// deviations of ~3.4e-5/~5.5e-5 vs the oracle — only 1.8x under the 1e-4
-// gate, unstable for the 24-case regression. With the pre-truncated operand
-// the in-cube HF32 conversion is the identity (mantissa already 10-bit), so
-// the GEMM consumes exactly the oracle's operand and the residual collapses
-// to sum-order noise.
+// Prepare the 11-fraction-bit projection weights once for either entry point.
+// Keep the rounded values in FP32 for the matrix multiply.
 at::Tensor PrepareHcFnT(const at::Tensor &hcFn)
 {
     at::Tensor transpose = hcFn.t().contiguous();
-    // RTZ to the frozen route's ten-bit HF32 mantissa.
-    at::Tensor mask = at::scalar_tensor(~((1 << 13) - 1), hcFn.options().dtype(at::kInt));
-    return at::bitwise_and(transpose.view(at::kInt), mask).view(hcFn.scalar_type());
+    // Adding half an ulp to the magnitude bits rounds halfway values away from zero.
+    constexpr int32_t lowBits = (1 << 12) - 1;
+    constexpr int32_t halfUlp = 1 << 11;
+    at::Tensor bits = transpose.view(at::kInt);
+    at::Tensor rounded = at::add(bits, halfUlp);
+    at::Tensor mask = at::scalar_tensor(~lowBits, hcFn.options().dtype(at::kInt));
+    return at::bitwise_and(rounded, mask).view(hcFn.scalar_type());
 }
 
 const at::Tensor &GetHcFnT(const at::Tensor &hc_fn)
@@ -190,12 +184,8 @@ at::Tensor MakeMatmulTiling(platform_ascendc::PlatformAscendC &platform, int64_t
         mmTiling.SetAType(mt::TPosition::GM, mt::CubeFormat::ND, mt::DataType::DT_FLOAT, false);
         mmTiling.SetBType(mt::TPosition::GM, mt::CubeFormat::ND, mt::DataType::DT_FLOAT, false);
         mmTiling.SetShape(B, mix, kSeg);
-        // HF32 mad type, pairing with the kernel's SetHF32(true, 0) — the
-        // v6-proven configuration (see the arbitration note in
-        // op_kernel/hc_pre_matmul.cpp: the "SetHF32(true) diverges" platform
-        // note traces to the merge-round hand-written Mmad probes, not to
-        // MatmulImpl; KEEP_FLOAT false,0 was measured 30% slower this round)
-        mmTiling.SetMadType(mt::MatrixMadType::HF32);
+        // Match SetHF32(false, 0) and preserve the prepared weight precision.
+        mmTiling.SetMadType(mt::MatrixMadType::NORMAL);
         TORCH_CHECK(mmTiling.GetTiling(mmHeader.cubeTiling) == 0, "MatmulApiTiling failed");
         // mandatory overwrite (ascendc-api-matmul-tiling.md checklist): M/N/Ka/Kb
         mmHeader.cubeTiling.M = static_cast<uint32_t>(B);

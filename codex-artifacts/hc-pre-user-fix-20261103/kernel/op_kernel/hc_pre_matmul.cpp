@@ -1,8 +1,8 @@
 /*
  * HcPre K2 — cube kernel (AIC only), CANN-reference round.
  *
- * torch_ops/hc_pre.py stage covered: C (HF32 GEMM + inv_rms scaling — the
- * scaling itself lives in K3's epilogue; this kernel emits raw partials).
+ * HC_Pre stage C computes the split-K FP32 projection. K3 applies the
+ * row normalization to the summed projection. This kernel emits the raw partials.
  *
  * CANN implementation pattern (per-round mandate): MatmulImpl standard usage
  * — archive_tasks/matmul_leakyrelu + ascendc-tiling-design
@@ -24,17 +24,7 @@
  * M and N stay single tiles (M <= 128; N = 24 is a multiple of the fp32
  * fractal c0 = 8, no tail). blockDim == KS == AIC cores used.
  *
- * Precision: HF32 cube mode — host SetMadType(MatrixMadType::HF32) +
- * kernel SetHF32(true, 0), the v6-proven configuration (three rounds of
- * evaluate PASS on this platform). D-fix correction of the previous claim:
- * the in-cube HF32 conversion is a NEAREST rounding (tie-even/tie-away per
- * the transMode flag), NOT the RTZ truncation the oracle's _to_hf32 applies
- * — measured on contract data it leaves the post/pre outputs short of the
- * 1e-4/99.5% gate by up to 5.5e-5 systematic deviation (all-positive
- * hc_fn makes the bias one-sided). The host GetHcFnT therefore pre-truncates
- * the B operand to the 10-bit mantissa (bit-exact with the oracle), which
- * makes the in-cube conversion the identity; the A operand is bf16-origin
- * and lossless under any rounding.
+ * Precision: FP32 cube mode preserves the host-prepared projection weights.
  *
  * Platform workaround (W1, mandatory): the MatmulImpl trans-B (isTrans=true)
  * path produces misaligned output on this platform, so the host pre-transposes
@@ -73,20 +63,8 @@ public:
         cGm_.SetGlobalBuffer((__gm__ float *)partialIn);
         mm_.SetSubBlockIdx(0);
         mm_.Init(&header_.cubeTiling, pipe);
-        // HF32 cube mode with clearRtol=0, pairing with the host
-        // MatrixMadType::HF32 — the v6-proven configuration (three rounds of
-        // evaluate PASS, K2 = 10.74us). Arbitration note: the requirements
-        // "SetHF32(true) diverges" constraint traces to the merge-round
-        // hand-written Mmad path (SetHF32Mode(true)+RTZ probes, trace.md
-        // L222), NOT to MatmulImpl; KEEP_FLOAT (false,0) was measured 30%
-        // slower this round (fp32 mad throughput = 1/4 of HF32, turning this
-        // bandwidth-bound skinny GEMM compute-bound: 13.9us vs 10.7us).
-        // D-fix measurement: transMode 0 vs 1 alters only tie handling
-        // (post/pre arrays differ at 1e-7 on contract data — 1 and 2 of 16
-        // elements), far below the 1e-4 gate; the B operand's RTZ
-        // pre-truncation in the host GetHcFnT makes the in-cube HF32
-        // conversion the identity, so this mode flag is precision-neutral.
-        mm_.SetHF32(true, 0);
+        // Pair with MatrixMadType::NORMAL to preserve 11 fractional bits.
+        mm_.SetHF32(false, 0);
     }
 
     __aicore__ inline void Process()
