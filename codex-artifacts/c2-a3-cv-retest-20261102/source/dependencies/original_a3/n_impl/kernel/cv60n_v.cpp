@@ -5,22 +5,23 @@
 //
 // Semantics follow the frozen reference family exactly:
 //  - ratio=2 pooling, globally position-aligned pairs (2g, 2g+1)
-//  - odd-start requests read the (start-1)%32 ring residual for the even
+//  - odd-start requests read the (start-1)%stateSlots ring residual for the even
 //    member of their first pair (that read is NOT page-gated)
 //  - completion rows additionally require a valid page (0 < page < P)
 //  - pooled value is rounded to BF16 BEFORE the RMSNorm reduction
 //  - single-Exp stable two-input softmax, 1/512 mean, Rsqrt, gamma in FP32
-//  - ring tail = min(used,32) rows of raw FP32 pair data; page-gated
+//  - ring tail = min(used,stateSlots) rows of raw FP32 pair data; page-gated
 //  - requests failing validation (start<0, used<=0, used>maxq, bad base,
 //    page outside (0,P)) contribute nothing at all
 //
-// Ring self-collision: when start is odd and used >= 32, the write window
-// covers all 32 slots including the residual slot (start-1)%32. The row whose
-// seg maps to that slot (seg = 31 + 32*ceil((used-32-31)/32), clamped) skips
+// Ring self-collision: when start is odd and used >= stateSlots, the write window
+// covers all stateSlots slots including the residual slot (start-1)%stateSlots. The row whose
+// seg maps to that slot (seg = stateSlots-1 + stateSlots*((used-tail)/stateSlots)) skips
 // its own write; the core owning the request's first completion row (row
 // `base`) performs that write after its residual read. Every core derives the
 // same rule from metadata alone - no cross-core synchronization.
 #include "kernel_operator.h"
+#include "cv60n_state_index.h"
 #include <cstdint>
 
 using namespace AscendC;
@@ -28,7 +29,6 @@ using namespace AscendC;
 namespace {
 constexpr int32_t D = 512;             // head dim (floats per kv / score half)
 constexpr int32_t PAIR_COLS = 1024;    // floats per pair row (kv | score)
-constexpr int32_t RING = 32;           // ring slots per page
 
 template<int CHUNK_TILE>
 class Cv60nVectorV {
@@ -40,9 +40,9 @@ class Cv60nVectorV {
 public:
     __aicore__ inline void Init(GM_ADDR pair, GM_ADDR state, GM_ADDR metadata,
                                 GM_ADDR gamma, GM_ADDR out,
-                                int64_t rows, int64_t pages, int32_t batches,
+                                int64_t rows, int64_t pages, int64_t stateSlots, int32_t batches,
                                 float eps, int64_t maxq) {
-        rows_ = rows; pages_ = pages; batches_ = batches; eps_ = eps; maxq_ = maxq;
+        rows_ = rows; pages_ = pages; stateSlots_ = stateSlots; batches_ = batches; eps_ = eps; maxq_ = maxq;
         pair_.SetGlobalBuffer((__gm__ float*)pair);
         state_.SetGlobalBuffer((__gm__ float*)state);
         meta_.SetGlobalBuffer((__gm__ int32_t*)metadata);
@@ -131,7 +131,7 @@ private:
             if (!RequestValid(b, s, u, base, page)) continue;
             if (base + u <= begin_ || base >= end_) continue;
             if ((s & 1) != 0 && base >= begin_) return false;
-            const int64_t tail = u < RING ? u : RING;
+            const int64_t tail = cv60n_state::TailRows(u, stateSlots_);
             if (base + u - tail < end_) return false;
         }
         return true;
@@ -342,12 +342,9 @@ private:
     }
 
     // Ownership-transfer row of one request: the seg in the write window whose
-    // slot equals the residual slot (start-1)%32, i.e. seg % 32 == 31.
+    // slot equals the residual slot (start-1)%stateSlots, i.e. seg % stateSlots == stateSlots-1.
     __aicore__ inline int64_t TransferSeg(int64_t used) const {
-        const int64_t tail = used < RING ? used : RING;
-        const int64_t seg = 31 + 32 * ((used - tail) / RING);
-        if (seg >= used - tail && seg <= used - 1) return seg;
-        return -1;
+        return cv60n_state::TransferSegment(used, stateSlots_);
     }
 
     __aicore__ inline void ProcessChunk(int64_t c0, int64_t c1) {
@@ -381,7 +378,7 @@ private:
                 if (residual) {
                     compRes[compCount] = resCount;
                     resRow[resCount] = r;
-                    resAddr[resCount] = (page * RING + (s - 1) % RING) * PAIR_COLS;
+                    resAddr[resCount] = cv60n_state::StateRow(page, s - 1, stateSlots_) * PAIR_COLS;
                     ++resCount;
                 } else {
                     const int64_t from = r > 0 ? r - 1 : 0;
@@ -392,12 +389,12 @@ private:
             // Transfer ownership: this core owns the reader row `base` of an
             // active transfer and performs the colliding slot write itself.
             // Only an odd start reads the residual, so only then can a
-            // same-round write to slot (start-1)%32 race that read.
+            // same-round write to slot (start-1)%stateSlots race that read.
             const int64_t seg = (s & 1) ? TransferSeg(u) : -1;
             if (seg >= 0 && base >= c0 && base < c1) {
                 xferHere = true;
                 xferSrc = (base + seg) * PAIR_COLS;
-                xferDst = (page * RING + (s - 1) % RING) * PAIR_COLS;
+                xferDst = cv60n_state::StateRow(page, s - 1, stateSlots_) * PAIR_COLS;
             }
             if (base + u > c0 && base < c1) ringHere = true;
         }
@@ -424,7 +421,7 @@ private:
                 const int32_t b = metaLocal_.GetValue(2 * batches_ + i);
                 int64_t s, u, base, page;
                 RequestValid(b, s, u, base, page);
-                const int64_t tail = u < RING ? u : RING;
+                const int64_t tail = cv60n_state::TailRows(u, stateSlots_);
                 int64_t lo = base + u - tail;
                 if (lo < c0) lo = c0;
                 int64_t hi = base + u < c1 ? base + u : c1;
@@ -471,18 +468,18 @@ private:
 
     // Ring rows [lo, hi) of one request: source rows are contiguous in the
     // staged pair block; destination slots are consecutive with at most one
-    // wrap around the 32-slot page.
+    // wrap around the runtime-sized page.
     __aicore__ inline void WriteRunOne(int64_t lo, int64_t hi, int64_t start,
                                        int64_t base, int64_t page, int64_t loadFrom) {
         if (lo >= hi) return;
         const int64_t count = hi - lo;
-        const int64_t slot0 = (start + lo - base) % RING;
-        const int64_t first = count < RING - slot0 ? count : RING - slot0;
+        const int64_t slot0 = cv60n_state::Slot(start + lo - base, stateSlots_);
+        const int64_t first = cv60n_state::FirstRun(count, slot0, stateSlots_);
         auto src = pairLocal_[(lo - loadFrom) * PAIR_COLS];
-        DataCopy(state_[(page * RING + slot0) * PAIR_COLS], src,
+        DataCopy(state_[cv60n_state::StateRow(page, slot0, stateSlots_) * PAIR_COLS], src,
                  static_cast<uint32_t>(first * PAIR_COLS));
         if (first < count) {
-            DataCopy(state_[page * RING * PAIR_COLS], src[first * PAIR_COLS],
+            DataCopy(state_[cv60n_state::StateRow(page, 0, stateSlots_) * PAIR_COLS], src[first * PAIR_COLS],
                      static_cast<uint32_t>((count - first) * PAIR_COLS));
         }
     }
@@ -548,7 +545,7 @@ private:
     LocalTensor<bfloat16_t> outLocal_, bf_, outSlot_[2];
     TEventID evLoad_[2], evIn_[2], evOut_[2];
     bool usePipe_ = false;
-    int64_t rows_, pages_, maxq_;
+    int64_t rows_, pages_, stateSlots_, maxq_;
     int32_t batches_, listLen_;
     float eps_;
     int64_t begin_, end_;
@@ -556,8 +553,8 @@ private:
 }  // namespace
 
 #define CV60N_V_ARGS GM_ADDR pair, GM_ADDR state, GM_ADDR metadata, GM_ADDR gamma, GM_ADDR out, \
-    int64_t rows, int64_t pages, int32_t batches, float eps, int64_t maxq
-#define CV60N_V_PASS pair, state, metadata, gamma, out, rows, pages, batches, eps, maxq
+    int64_t rows, int64_t pages, int64_t stateSlots, int32_t batches, float eps, int64_t maxq
+#define CV60N_V_PASS pair, state, metadata, gamma, out, rows, pages, stateSlots, batches, eps, maxq
 
 extern "C" __global__ __aicore__ void cv60n_v_c8(CV60N_V_ARGS) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -573,17 +570,27 @@ extern "C" __global__ __aicore__ void cv60n_v_c16(CV60N_V_ARGS) {
 }
 
 #ifndef __CCE_KT_TEST__
+extern "C" void launch_cv60n_v_paged(uint32_t blocks, int32_t chunk, void* stream,
+                               uint8_t* pair, uint8_t* state, uint8_t* metadata,
+                               uint8_t* gamma, uint8_t* out,
+                               int64_t rows, int64_t pages, int64_t stateSlots, int32_t batches,
+                               float eps, int64_t maxq) {
+    if (chunk <= 8) {
+        cv60n_v_c8<<<blocks, nullptr, stream>>>(pair, state, metadata, gamma, out,
+            rows, pages, stateSlots, batches, eps, maxq);
+    } else {
+        cv60n_v_c16<<<blocks, nullptr, stream>>>(pair, state, metadata, gamma, out,
+            rows, pages, stateSlots, batches, eps, maxq);
+    }
+}
+
+// Preserve the original C launcher ABI for existing 32-slot callers.
 extern "C" void launch_cv60n_v(uint32_t blocks, int32_t chunk, void* stream,
                                uint8_t* pair, uint8_t* state, uint8_t* metadata,
                                uint8_t* gamma, uint8_t* out,
                                int64_t rows, int64_t pages, int32_t batches,
                                float eps, int64_t maxq) {
-    if (chunk <= 8) {
-        cv60n_v_c8<<<blocks, nullptr, stream>>>(pair, state, metadata, gamma, out,
-            rows, pages, batches, eps, maxq);
-    } else {
-        cv60n_v_c16<<<blocks, nullptr, stream>>>(pair, state, metadata, gamma, out,
-            rows, pages, batches, eps, maxq);
-    }
+    launch_cv60n_v_paged(blocks, chunk, stream, pair, state, metadata, gamma, out,
+                         rows, pages, 32, batches, eps, maxq);
 }
 #endif

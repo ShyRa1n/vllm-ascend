@@ -16,8 +16,8 @@
 
 extern "C" void launch_cv60n_gemm(uint32_t, int32_t, int32_t, aclrtStream, uint8_t*, uint8_t*,
                                   uint8_t*, uint8_t*, uint8_t*);
-extern "C" void launch_cv60n_v(uint32_t, int32_t, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
-                               uint8_t*, int64_t, int64_t, int32_t, float, int64_t);
+extern "C" void launch_cv60n_v_paged(uint32_t, int32_t, void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*,
+                                     uint8_t*, int64_t, int64_t, int64_t, int32_t, float, int64_t);
 
 namespace {
 constexpr int64_t kH = 5120;
@@ -118,8 +118,8 @@ at::Tensor run_v_out(at::Tensor pair, at::Tensor latent, at::Tensor state,
     TORCH_CHECK(latent.size(0) == pair.size(0), "latent rows must equal pair rows");
     TORCH_CHECK(state.device().type() == c10::DeviceType::PrivateUse1 &&
                 state.scalar_type() == at::kFloat && state.is_contiguous() &&
-                state.dim() == 3 && state.size(1) == 32 && state.size(2) == 1024,
-                "state must be contiguous [P,32,1024] NPU FP32");
+                state.dim() == 3 && state.size(1) > 0 && state.size(2) == 1024,
+                "state must be contiguous [P,L,1024] NPU FP32");
     TORCH_CHECK(metadata.device() == pair.device() && metadata.scalar_type() == at::kInt &&
                 metadata.is_contiguous() && metadata.dim() == 2 && metadata.size(0) == 5,
                 "metadata must be contiguous [5,B] NPU INT32");
@@ -130,6 +130,7 @@ at::Tensor run_v_out(at::Tensor pair, at::Tensor latent, at::Tensor state,
         TORCH_CHECK(a.device() == pair.device(), "device mismatch");
     }
     TORCH_CHECK(chunk == 8 || chunk == 16, "V tile chunk must be 8 or 16");
+    TORCH_CHECK(state.size(1) >= chunk, "state slots must cover one V tile");
     TORCH_CHECK(eps >= 0.0 && maxq >= 0, "invalid scalars");
     const int64_t T = pair.size(0);
     const int64_t P = state.size(0);
@@ -143,8 +144,8 @@ at::Tensor run_v_out(at::Tensor pair, at::Tensor latent, at::Tensor state,
     auto o = static_cast<uint8_t*>(latent.data_ptr());
     const float epsF = static_cast<float>(eps);
     at_npu::native::OpCommand::RunOpApi("cv60n_v_run", [=]() -> int {
-        launch_cv60n_v(48, static_cast<int32_t>(chunk), stream, p, s, m, g, o,
-                       T, P, B, epsF, maxq);
+        launch_cv60n_v_paged(48, static_cast<int32_t>(chunk), stream, p, s, m, g, o,
+                       T, P, state.size(1), B, epsF, maxq);
         return 0;
     });
     return latent;
@@ -163,8 +164,8 @@ at::Tensor run_out(const at::Tensor& x, const at::Tensor& w, at::Tensor pair,
                 "latent must be contiguous [T,512] NPU BF16");
     TORCH_CHECK(state.device().type() == c10::DeviceType::PrivateUse1 &&
                 state.scalar_type() == at::kFloat && state.is_contiguous() &&
-                state.dim() == 3 && state.size(1) == 32 && state.size(2) == 1024,
-                "state must be contiguous [P,32,1024] NPU FP32");
+                state.dim() == 3 && state.size(1) > 0 && state.size(2) == 1024,
+                "state must be contiguous [P,L,1024] NPU FP32");
     TORCH_CHECK(metadata.device() == x.device() && metadata.scalar_type() == at::kInt &&
                 metadata.is_contiguous() && metadata.dim() == 2 && metadata.size(0) == 5,
                 "metadata must be contiguous [5,B] NPU INT32");
@@ -179,6 +180,7 @@ at::Tensor run_out(const at::Tensor& x, const at::Tensor& w, at::Tensor pair,
                 "invalid prepared buffers");
     TORCH_CHECK(blocks > 0 && blocks <= 1024 && (mode == 0 || mode == 1), "invalid launch");
     TORCH_CHECK(chunk == 8 || chunk == 16, "V tile chunk must be 8 or 16");
+    TORCH_CHECK(state.size(1) >= chunk, "state slots must cover one V tile");
     TORCH_CHECK(eps >= 0.0 && maxq >= 0, "invalid scalars");
     const int64_t T = x.size(0);
     const int64_t P = state.size(0);
@@ -198,8 +200,8 @@ at::Tensor run_out(const at::Tensor& x, const at::Tensor& w, at::Tensor pair,
     at_npu::native::OpCommand::RunOpApi("cv60n_run", [=]() -> int {
         launch_cv60n_gemm(gemmBlocks, static_cast<int32_t>(mode), static_cast<int32_t>(layout),
                           stream, a, b, p, scratch, t);
-        launch_cv60n_v(48, static_cast<int32_t>(chunk), stream, p, s, m, g, o,
-                       T, P, B, epsF, maxq);
+        launch_cv60n_v_paged(48, static_cast<int32_t>(chunk), stream, p, s, m, g, o,
+                       T, P, state.size(1), B, epsF, maxq);
         return 0;
     });
     return latent;
